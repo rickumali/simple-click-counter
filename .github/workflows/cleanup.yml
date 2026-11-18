@@ -1,0 +1,53 @@
+name: Clean up old S3 deploys
+
+# Removes old s3://$S3_BUCKET/deploys/<sha>/ prefixes.
+# Never touches latest/ or the deploy latest/ was built from.
+# Run manually (dry run by default) or weekly on a schedule.
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "Number of newest deploys to always keep"
+        required: true
+        default: "5"
+      older_than_days:
+        description: "Only delete deploys older than this many days (0 = no age limit)"
+        required: true
+        default: "0"
+      dry_run:
+        description: "List what would be deleted without deleting"
+        type: boolean
+        default: true
+  schedule:
+    # Mondays 07:17 UTC. Scheduled runs really delete (see DRY_RUN below).
+    - cron: "17 7 * * 1"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-s3 # never run alongside a deploy
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      S3_BUCKET: ${{ vars.S3_BUCKET }}
+      # Scheduled runs have no inputs: keep 10, delete only if > 30 days old.
+      KEEP: ${{ inputs.keep || '10' }}
+      OLDER_THAN_DAYS: ${{ inputs.older_than_days || '30' }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Remove old deploys
+        run: ./scripts/cleanup-deploys.sh

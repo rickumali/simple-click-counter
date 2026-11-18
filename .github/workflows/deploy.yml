@@ -1,0 +1,115 @@
+name: Deploy to S3
+
+# Builds the static site and uploads it to S3 twice:
+#   s3://$S3_BUCKET/deploys/<sha>/   immutable copy for this commit
+#   s3://$S3_BUCKET/latest/          the most recent deploy
+#
+# Re-running for the same commit overwrites the same prefix (sync --delete),
+# so the workflow is idempotent.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # needed to request the OIDC token for AWS
+  contents: read
+
+concurrency:
+  group: deploy-s3
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.urls.outputs.latest_url }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      S3_BUCKET: ${{ vars.S3_BUCKET }}
+      # Optional. Base URL the site is served from. Defaults to the S3 website
+      # endpoint; set it to the CloudFront/custom domain once that exists.
+      PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
+      # Optional. When set, /latest/* is invalidated after each deploy.
+      CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+      SHA: ${{ github.sha }}
+    steps:
+      - name: Check required configuration
+        run: |
+          missing=0
+          for v in AWS_REGION AWS_ROLE_ARN S3_BUCKET; do
+            if [ -z "${!v}" ]; then echo "::error::Variable $v is not set (Settings > Environments > production)"; missing=1; fi
+          done
+          exit $missing
+
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      # Two builds, because Next.js bakes the base path into asset URLs.
+      - name: Build for deploys/<sha>
+        run: |
+          BASE_PATH="/deploys/${SHA}" bun run build
+          mv out out-sha
+
+      - name: Build for latest
+        run: |
+          BASE_PATH="/latest" bun run build
+          mv out out-latest
+
+      - name: Write deploy metadata
+        run: |
+          for dir in out-sha out-latest; do
+            jq -n \
+              --arg sha "$SHA" \
+              --arg ref "$GITHUB_REF_NAME" \
+              --arg run_id "$GITHUB_RUN_ID" \
+              --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '{sha: $sha, ref: $ref, run_id: $run_id, deployed_at: $deployed_at}' \
+              > "$dir/deploy.json"
+          done
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload deploys/<sha>
+        run: ./scripts/upload-site.sh out-sha "s3://${S3_BUCKET}/deploys/${SHA}"
+
+      - name: Upload latest
+        run: ./scripts/upload-site.sh out-latest "s3://${S3_BUCKET}/latest"
+
+      - name: Invalidate CloudFront (optional)
+        if: env.CLOUDFRONT_DISTRIBUTION_ID != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "/latest/*"
+
+      - name: Report URLs
+        id: urls
+        run: |
+          base="${PUBLIC_BASE_URL:-http://${S3_BUCKET}.s3-website-${AWS_REGION}.amazonaws.com}"
+          base="${base%/}"
+          sha_url="${base}/deploys/${SHA}/"
+          latest_url="${base}/latest/"
+          echo "sha_url=${sha_url}" >> "$GITHUB_OUTPUT"
+          echo "latest_url=${latest_url}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Deployed \`${SHA:0:7}\`"
+            echo
+            echo "- This commit: ${sha_url}"
+            echo "- Latest: ${latest_url}"
+          } >> "$GITHUB_STEP_SUMMARY"
