@@ -14,6 +14,12 @@ export default function Home() {
       >
         Count: {count}
       </button>
+      <button
+        onClick={() => setCount(0)}
+        className="rounded-xl bg-gray-200 px-6 py-2 text-lg font-semibold text-gray-800 hover:bg-gray-300 active:scale-95 transition-all"
+      >
+        Reset
+      </button>
     </div>
   );
 }
