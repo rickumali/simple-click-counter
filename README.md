@@ -207,12 +207,47 @@ provider URL `https://token.actions.githubusercontent.com` and audience
 ### 7. Create the deploy role
 
 `infra/aws/trust-policy.json` lets **only** workflow jobs in this repository
-that run in the GitHub environment named `production` assume the role. If you
-fork or rename the repository, change the `sub` value
-(`repo:<owner>/<repo>:environment:production`).
+that run in the GitHub environment named `production` assume the role. It
+does this by matching the `sub` (subject) claim of GitHub's OIDC token, which
+looks like `SUB_PREFIX:environment:production`.
+
+**Get `SUB_PREFIX` from GitHub; don't type it by hand.** Its format depends on
+the repository:
+
+- Repositories with **immutable subject claims** (the default for repositories
+  created after mid-2026, and an opt-in for older ones) include the owner and
+  repository IDs: `repo:rickumali@40336/simple-click-counter@1463260482`.
+- Other repositories use names only: `repo:rickumali/simple-click-counter`.
+
+If the prefix doesn't match exactly, sign-in fails with `Not authorized to
+perform sts:AssumeRoleWithWebIdentity`. Ask GitHub which prefix this
+repository uses (needs the [GitHub CLI](https://cli.github.com), signed in with
+admin access to the repo):
 
 ```bash
-sed "s/ACCOUNT_ID/$ACCOUNT_ID/g" infra/aws/trust-policy.json > /tmp/trust-policy.json
+export GITHUB_REPO=rickumali/simple-click-counter   # <owner>/<repo>
+export SUB_PREFIX=$(gh api "repos/$GITHUB_REPO/actions/oidc/customization/sub" --jq .sub_claim_prefix)
+echo "$SUB_PREFIX"
+```
+
+If that prints nothing or `null`, build the immutable form from the IDs
+yourself and check which format the repo uses under **Settings → Actions →
+General → OpenID Connect**:
+
+```bash
+gh api "repos/$GITHUB_REPO" --jq '"repo:\(.owner.login)@\(.owner.id)/\(.name)@\(.id)"'
+```
+
+If you fork, rename or transfer the repository, fetch the value again and
+update the role's trust policy (`aws iam update-assume-role-policy`).
+
+```bash
+sed -e "s/ACCOUNT_ID/$ACCOUNT_ID/g" -e "s|SUB_PREFIX|$SUB_PREFIX|g" \
+  infra/aws/trust-policy.json > /tmp/trust-policy.json
+grep '"token.actions.githubusercontent.com:sub"' /tmp/trust-policy.json   # check it
+```
+
+```bash
 aws iam create-role --role-name "$ROLE_NAME" \
   --assume-role-policy-document file:///tmp/trust-policy.json \
   --description "GitHub Actions deploy for simple-click-counter"
@@ -371,7 +406,7 @@ When you add it:
 
 | Symptom | Likely cause |
 |---|---|
-| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | The trust policy's `sub` doesn't match: wrong owner/repo, or the job isn't running in the `production` environment. |
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | The trust policy's `sub` doesn't match. Compare it with `gh api repos/<owner>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix` (immutable subjects include `@<id>` after the owner and repo names; see AWS step 7). Also check that the job runs in the `production` environment. |
 | `Variable … is not set` in the first step | The variables are missing, or were added to a different environment. |
 | `AccessDenied` on `s3 sync` | The role's inline policy has the wrong bucket name, or `S3_BUCKET` is wrong. |
 | `403 Forbidden` in the browser | Block Public Access (account or bucket level) is still on, or the bucket policy is missing. |
