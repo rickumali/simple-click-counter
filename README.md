@@ -53,6 +53,19 @@ Every push to `main` runs `.github/workflows/deploy.yml`, which:
 Each folder includes a `deploy.json` saying which commit, branch and workflow
 run produced it.
 
+Every HTML page also carries the build time (UTC) and commit in a comment
+right after the doctype, so "View page source" shows which build you're
+getting:
+
+```html
+<!DOCTYPE html><!--20261122T194418Z_4a2ca9e-->
+```
+
+That comment is the Next.js build ID, set in `next.config.ts`. Next.js keeps
+only its first 24 characters and turns `-` into `_`, hence the compact
+format. Each of the two builds in a deploy stamps its own time, so
+`deploys/<sha>/` and `latest/` can differ by a few seconds.
+
 The workflow is **idempotent**: re-running it for the same commit syncs into
 the same `deploys/<sha>/` folder with `--delete`, so you get the same result
 rather than a duplicate. Deploy and cleanup share a concurrency group, so they
@@ -435,6 +448,7 @@ export DISTRIBUTION_ID=E1ABCDEFGHIJKL           # yours
 export CF_DOMAIN=d1234abcd.cloudfront.net       # yours
 curl -sI "https://$CF_DOMAIN/latest/" | grep -iE '^(HTTP|x-cache|cache-control)'
 curl -s "https://$CF_DOMAIN/latest/deploy.json"
+curl -s "https://$CF_DOMAIN/latest/" | head -c 48; echo   # build time + commit
 ```
 
 No custom error pages are needed: the S3 website endpoint already returns
