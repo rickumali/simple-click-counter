@@ -51,7 +51,7 @@ Every push to `main` runs `.github/workflows/deploy.yml`, which:
    ```
 
 Each folder includes a `deploy.json` saying which commit, branch and workflow
-run produced it.
+run produced it, and when it was built (`built_at`).
 
 Every HTML page also carries the build time (UTC) and commit in a comment
 right after the doctype, so "View page source" shows which build you're
@@ -63,8 +63,7 @@ getting:
 
 That comment is the Next.js build ID, set in `next.config.ts`. Next.js keeps
 only its first 24 characters and turns `-` into `_`, hence the compact
-format. Each of the two builds in a deploy stamps its own time, so
-`deploys/<sha>/` and `latest/` can differ by a few seconds.
+format.
 
 The workflow is **idempotent**: re-running it for the same commit syncs into
 the same `deploys/<sha>/` folder with `--delete`, so you get the same result
