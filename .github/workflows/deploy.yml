@@ -57,6 +57,12 @@ jobs:
       - name: Lint
         run: bun run lint
 
+      # One timestamp for both builds, so deploys/<sha>/ and latest/ share a
+      # build ID. It shows up in every page as
+      # <!DOCTYPE html><!--20261122T194418Z_4a2ca9e--> (see next.config.ts).
+      - name: Set build time
+        run: echo "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
       # Two builds, because Next.js bakes the base path into asset URLs.
       - name: Build for deploys/<sha>
         run: |
@@ -75,8 +81,9 @@ jobs:
               --arg sha "$SHA" \
               --arg ref "$GITHUB_REF_NAME" \
               --arg run_id "$GITHUB_RUN_ID" \
+              --arg built_at "$BUILD_TIME" \
               --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              '{sha: $sha, ref: $ref, run_id: $run_id, deployed_at: $deployed_at}' \
+              '{sha: $sha, ref: $ref, run_id: $run_id, built_at: $built_at, deployed_at: $deployed_at}' \
               > "$dir/deploy.json"
           done
 

@@ -10,7 +10,7 @@ a public AWS S3 website by GitHub Actions.
 - [One-time setup: GitHub](#one-time-setup-github)
 - [Deploying](#deploying)
 - [Cleaning up old deploys](#cleaning-up-old-deploys)
-- [Adding CloudFront later](#adding-cloudfront-later)
+- [Optional one-time setup: CloudFront](#optional-one-time-setup-cloudfront)
 - [Troubleshooting](#troubleshooting)
 
 ## Local development
@@ -51,7 +51,19 @@ Every push to `main` runs `.github/workflows/deploy.yml`, which:
    ```
 
 Each folder includes a `deploy.json` saying which commit, branch and workflow
-run produced it.
+run produced it, and when it was built (`built_at`).
+
+Every HTML page also carries the build time (UTC) and commit in a comment
+right after the doctype, so "View page source" shows which build you're
+getting:
+
+```html
+<!DOCTYPE html><!--20261122T194418Z_4a2ca9e-->
+```
+
+That comment is the Next.js build ID, set in `next.config.ts`. Next.js keeps
+only its first 24 characters and turns `-` into `_`, hence the compact
+format.
 
 The workflow is **idempotent**: re-running it for the same commit syncs into
 the same `deploys/<sha>/` folder with `--delete`, so you get the same result
@@ -311,7 +323,7 @@ following. These are *variables*, not secrets; nothing in them is sensitive.
 | `AWS_ROLE_ARN` | yes | `arn:aws:iam::123456789012:role/gha-simple-click-counter-deploy` |
 | `S3_BUCKET` | yes | `simple-click-counter-abc123` |
 | `PUBLIC_BASE_URL` | recommended | the website endpoint from AWS step 5, e.g. `http://simple-click-counter-abc123.s3-website-us-east-1.amazonaws.com` |
-| `CLOUDFRONT_DISTRIBUTION_ID` | no | leave unset until [CloudFront](#adding-cloudfront-later) exists |
+| `CLOUDFRONT_DISTRIBUTION_ID` | no | leave unset until [CloudFront](#optional-one-time-setup-cloudfront) exists |
 
 `PUBLIC_BASE_URL` is only used to print links in the job summary. If you leave
 it unset, the workflow guesses the dash-style website URL, which is wrong in
@@ -363,44 +375,145 @@ You can run the same script locally with your own AWS credentials:
 S3_BUCKET="$BUCKET_NAME" KEEP=5 DRY_RUN=true ./scripts/cleanup-deploys.sh
 ```
 
-## Adding CloudFront later
+## Optional one-time setup: CloudFront
 
-Nothing here needs CloudFront yet, but the setup is ready for it:
+**Optional.** Skip this section if the plain S3 website URL (HTTP only) is
+enough, for example
+`http://simple-click-counter-rumali.s3-website-us-east-1.amazonaws.com/latest/`.
+Add CloudFront when you want HTTPS, a CDN cache in front of the bucket, or a
+custom domain. Like the AWS and GitHub setup above, you do this **once**;
+after that every deploy just works.
 
-- **Paths:** `/deploys/<sha>/` and `/latest/` work unchanged behind a CDN.
-- **Caching:** `Cache-Control` headers are already set.
+It assumes you've finished [One-time setup: AWS](#one-time-setup-aws) and
+[One-time setup: GitHub](#one-time-setup-github) and that `/latest/` loads
+from the S3 website endpoint.
+
+The rest of the repository is already ready for a CDN:
+
+- **Paths:** `/deploys/<sha>/` and `/latest/` work unchanged behind CloudFront.
+- **Caching:** `Cache-Control` headers are already set by
+  `scripts/upload-site.sh`, and CloudFront honours them.
 - **Invalidation:** if `CLOUDFRONT_DISTRIBUTION_ID` is set, the deploy
   workflow invalidates `/latest/*` after uploading. Per-commit folders never
   change, so they never need invalidating.
 - **Links:** `PUBLIC_BASE_URL` controls the URLs printed in the job summary.
 
-When you add it:
+The steps below use the **S3 website endpoint as a custom origin**. It's the
+simplest choice: the bucket stays public as it is now, `/latest/` keeps
+mapping to `/latest/index.html`, the existing `latest/404.html` error page
+keeps working, and CloudFront adds HTTPS for viewers. (For a private bucket
+instead, see [the alternative](#alternative-private-bucket-with-oac) at the
+end of this section.)
 
-1. Create a distribution. There are two origin choices:
-   - **S3 website endpoint as a custom origin (HTTP only)**. This is the
-     simplest: the bucket stays public, folder `index.html` handling keeps
-     working, and CloudFront adds HTTPS for viewers.
-   - **S3 REST endpoint with Origin Access Control (OAC)**. This lets the
-     bucket become private: replace the public-read bucket policy with the
-     OAC policy CloudFront gives you, and turn bucket Block Public Access
-     back on. The REST endpoint doesn't map `/latest/` to
-     `/latest/index.html`, so add a small CloudFront Function on viewer
-     requests that appends `index.html` to URIs ending in `/`. (The
-     `trailingSlash: true` setting in `next.config.ts` makes every route end
-     in `/`.) Set the custom error response for 403 and 404 to
-     `/latest/404.html`.
-2. Let the deploy role create invalidations:
+### 1. Create the distribution
 
-   ```bash
-   sed -e "s/ACCOUNT_ID/$ACCOUNT_ID/g" -e "s/DISTRIBUTION_ID/<your-distribution-id>/g" \
-     infra/aws/cloudfront-invalidation-policy.json > /tmp/cf-policy.json
-   aws iam put-role-policy --role-name "$ROLE_NAME" \
-     --policy-name cloudfront-invalidate --policy-document file:///tmp/cf-policy.json
-   ```
+Console: **CloudFront → Distributions → Create distribution**. The console
+layout changes from time to time; these are the settings that matter.
 
-3. In the GitHub `production` environment, set `CLOUDFRONT_DISTRIBUTION_ID`
-   and change `PUBLIC_BASE_URL` to `https://<distribution>.cloudfront.net` or
-   your custom domain.
+1. **Origin domain:** don't pick the bucket from the drop-down list (that's
+   the S3 REST endpoint). Paste the **bucket website endpoint** from AWS
+   step 5, without `http://` and without a path, e.g.
+   `simple-click-counter-rumali.s3-website-us-east-1.amazonaws.com`.
+   If the console offers **Use website endpoint**, choose it.
+2. **Origin path:** leave empty, so both `/latest/` and `/deploys/<sha>/` are
+   reachable.
+3. **Protocol (origin):** **HTTP only**. S3 website endpoints don't support
+   HTTPS; CloudFront still serves viewers over HTTPS.
+4. **Viewer protocol policy:** **Redirect HTTP to HTTPS**.
+5. **Allowed HTTP methods:** **GET, HEAD**.
+6. **Cache policy:** **CachingOptimized** (managed policy). It respects the
+   `Cache-Control` headers the deploy sets: hashed `_next/static/` files are
+   cached for a year, HTML is revalidated. It also turns on compression.
+   Leave **Origin request policy** and **Response headers policy** empty.
+7. **Web Application Firewall (WAF):** not needed for this site; choose not
+   to enable security protections (WAF is billed separately).
+8. **Price class:** your choice. "Use only North America and Europe" is the
+   cheapest.
+9. **Alternate domain name (CNAME)** and **Custom SSL certificate:** leave
+   empty unless you're adding a custom domain (see step 5).
+10. **Default root object:** leave empty. The S3 website endpoint already
+    handles `/` (including the optional root redirect from AWS step 5).
+
+Choose **Create distribution**. On the distribution's page, note:
+
+- the **Distribution ID**, e.g. `E1ABCDEFGHIJKL`
+- the **Distribution domain name**, e.g. `d1234abcd.cloudfront.net`
+
+Wait until **Last modified** changes from "Deploying" to a date (usually a few
+minutes), then check it. The first request may say `Miss`, a repeat `Hit`:
+
+```bash
+export DISTRIBUTION_ID=E1ABCDEFGHIJKL           # yours
+export CF_DOMAIN=d1234abcd.cloudfront.net       # yours
+curl -sI "https://$CF_DOMAIN/latest/" | grep -iE '^(HTTP|x-cache|cache-control)'
+curl -s "https://$CF_DOMAIN/latest/deploy.json"
+curl -s "https://$CF_DOMAIN/latest/" | head -c 48; echo   # build time + commit
+```
+
+No custom error pages are needed: the S3 website endpoint already returns
+`latest/404.html` with a 404 status, and CloudFront passes it through.
+
+### 2. Let the deploy role create invalidations
+
+`infra/aws/cloudfront-invalidation-policy.json` allows
+`cloudfront:CreateInvalidation` on this one distribution only. With the
+shell variables from AWS setup (`ACCOUNT_ID`, `ROLE_NAME`) still set:
+
+```bash
+sed -e "s/ACCOUNT_ID/$ACCOUNT_ID/g" -e "s/DISTRIBUTION_ID/$DISTRIBUTION_ID/g" \
+  infra/aws/cloudfront-invalidation-policy.json > /tmp/cf-policy.json
+aws iam put-role-policy --role-name "$ROLE_NAME" \
+  --policy-name cloudfront-invalidate --policy-document file:///tmp/cf-policy.json
+```
+
+Console: **IAM → Roles → `gha-simple-click-counter-deploy` → Permissions →
+Add permissions → Create inline policy → JSON**, paste the file with
+`ACCOUNT_ID` and `DISTRIBUTION_ID` filled in, and name it
+`cloudfront-invalidate`.
+
+### 3. Update the GitHub `production` environment
+
+**Settings → Environments → production → Environment variables:**
+
+| Variable | Value |
+|---|---|
+| `CLOUDFRONT_DISTRIBUTION_ID` | the Distribution ID from step 1 |
+| `PUBLIC_BASE_URL` | `https://<distribution domain name>` (or your custom domain), no trailing slash |
+
+### 4. Check a deploy
+
+Run **Actions → Deploy to S3 → Run workflow** on `main`. The
+**Invalidate CloudFront (optional)** step should now run instead of being
+skipped, and the summary links should point at CloudFront. If that step fails
+with `AccessDenied`, the inline policy from step 2 is missing or names the
+wrong distribution ID.
+
+The old S3 website URL keeps working too, since the bucket is still public.
+
+### 5. Custom domain (optional)
+
+1. Console: **AWS Certificate Manager**, in region **us-east-1** (CloudFront
+   only uses certificates from there) → **Request a public certificate** for
+   your domain, validated by DNS. Add the CNAME record it shows at your DNS
+   provider and wait for "Issued".
+2. **CloudFront → your distribution → General → Edit:** add the domain under
+   **Alternate domain names (CNAME)** and pick the certificate.
+3. At your DNS provider, point the domain at the distribution domain name
+   (a CNAME, or a Route 53 alias record for an apex domain).
+4. Change `PUBLIC_BASE_URL` to `https://<your-domain>`.
+
+### Alternative: private bucket with OAC
+
+Instead of the website endpoint you can use the **S3 REST endpoint with
+Origin Access Control (OAC)**, which lets the bucket become private: replace
+the public-read bucket policy with the OAC policy CloudFront gives you, and
+turn bucket Block Public Access back on. The REST endpoint doesn't map
+`/latest/` to `/latest/index.html`, so add a small CloudFront Function on
+viewer requests that appends `index.html` to URIs ending in `/`. (The
+`trailingSlash: true` setting in `next.config.ts` makes every route end in
+`/`.) Set the custom error response for 403 and 404 to `/latest/404.html`.
+The old S3 website URL stops working in this setup. Steps 2–4 above are the
+same.
 
 ## Troubleshooting
 
